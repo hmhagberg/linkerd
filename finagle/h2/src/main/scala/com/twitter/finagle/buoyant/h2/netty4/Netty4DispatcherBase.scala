@@ -2,7 +2,7 @@ package com.twitter.finagle.buoyant.h2
 package netty4
 
 import com.twitter.finagle.liveness.FailureDetector
-import com.twitter.finagle.liveness.FailureDetector.NullConfig
+import com.twitter.finagle.liveness.FailureDetector.{NullConfig, ThresholdConfig}
 import com.twitter.finagle.netty4.transport.{ChannelTransport, ChannelTransportContext}
 import com.twitter.finagle.stats.StatsReceiver
 import com.twitter.finagle.transport.Transport
@@ -15,6 +15,8 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReferenc
 
 import scala.annotation.tailrec
 import scala.jdk.CollectionConverters._
+
+import io.netty.util.concurrent.SingleThreadEventExecutor
 
 trait Netty4DispatcherBase[SendMsg <: Message, RecvMsg <: Message] {
 
@@ -47,6 +49,7 @@ trait Netty4DispatcherBase[SendMsg <: Message, RecvMsg <: Message] {
   }
 
   private[this] val pingPromise: AtomicReference[Promise[Unit]] = new AtomicReference(null)
+  private[this] val pingCounter: AtomicInteger = new AtomicInteger(0)
 
   protected[this] val OutstandingPingEx = Failure("Outstanding ping on HTTP/2 connection")
   protected[this] val eventLoop = transport.context match {
@@ -63,12 +66,23 @@ trait Netty4DispatcherBase[SendMsg <: Message, RecvMsg <: Message] {
         // thread.
         done.setDone()
       case Some(eventLoop) =>
+        val index = pingCounter.incrementAndGet()
+        if (log != null) {
+          val executor = eventLoop.asInstanceOf[SingleThreadEventExecutor]
+          log.debug(s"[$prefix] queuing failure detector ping #$index for HTTP/2 connection, tasks ${executor.pendingTasks()}, event loop $eventLoop")
+        }
         eventLoop.execute(
           () =>
-            if (pingPromise.compareAndSet(null, done)) {
-              val _ = writer.sendPing()
-            } else {
-              done.setException(OutstandingPingEx)
+            try {
+              if (pingPromise.compareAndSet(null, done)) {
+                log.debug(s"[$prefix] sending failure detector ping #$index for HTTP/2 connection")
+                val _ = writer.sendPing()
+              } else {
+                log.debug(s"[$prefix] outstanding failure detector ping #$index for HTTP/2 connection")
+                done.setException(OutstandingPingEx)
+              }
+            } catch {
+              case e: Throwable => log.debug(e, s"[$prefix] failed to send ping #$index")
             }
         )
     }
@@ -79,6 +93,9 @@ trait Netty4DispatcherBase[SendMsg <: Message, RecvMsg <: Message] {
     case None => FailureDetector(NullConfig, null, null)
     case Some(cfg) => FailureDetector(cfg, (ping _), stats.scope("failure_detector"))
   }
+  //protected[this] val failureDetector: FailureDetector = {
+  //  FailureDetector(ThresholdConfig(minPeriod = Duration.fromSeconds(20), closeTimeout = Duration.fromSeconds(15)), ping _, stats.scope("failure_detector"))
+  //}
   failureDetector.onClose.ensure {
     log.debug(s"failure detector closed HTTP/2 connection: $prefix")
     goAway(GoAway.InternalError); ()
@@ -184,6 +201,7 @@ trait Netty4DispatcherBase[SendMsg <: Message, RecvMsg <: Message] {
         if (f.ack()) {
           // client sent a ping and got acknowledgement. Satisfy promise to let failure detector
           // know the connection is still alive.
+          log.debug(s"[$prefix] received ping ack")
           val prevPingPromise = pingPromise.getAndSet(null)
           if (prevPingPromise != null) {
             prevPingPromise.setDone()

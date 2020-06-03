@@ -8,11 +8,14 @@ import com.twitter.util.{Future, Time}
 import io.netty.buffer.ByteBuf
 import io.netty.handler.codec.http2._
 import java.net.SocketAddress
+import java.util.concurrent.atomic.AtomicInteger
 
 private[netty4] trait Netty4H2Writer extends H2Transport.Writer {
 
   protected[this] def write(f: Http2Frame): Future[Unit]
   protected[this] def close(deadline: Time): Future[Unit]
+
+  private[this] def pingCounter = new AtomicInteger(0)
 
   /*
    * H2Transport.Writer -- netty4-agnostic h2 message writer
@@ -50,7 +53,7 @@ private[netty4] trait Netty4H2Writer extends H2Transport.Writer {
   }
 
   override def sendPing(): Future[Unit] = {
-    val frame = new DefaultHttp2PingFrame(0)
+    val frame = new DefaultHttp2PingFrame(pingCounter.getAndIncrement())
     write(frame)
   }
 

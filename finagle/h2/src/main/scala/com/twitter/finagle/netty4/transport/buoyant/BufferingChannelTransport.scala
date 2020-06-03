@@ -1,14 +1,19 @@
 package com.twitter.finagle.netty4.transport.buoyant
 
+import java.net.InetSocketAddress
+
 import com.twitter.concurrent.AsyncQueue
 import com.twitter.finagle.ChannelException
 import com.twitter.finagle.netty4.transport.ChannelTransport
 import com.twitter.util.{Future, Promise}
-import io.netty.channel.ChannelFuture
+import io.netty.channel.{ChannelFuture, EventLoop}
 import io.netty.{channel => nettyChan}
 import java.util
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+
+import com.twitter.logging.Logger
+import io.netty.handler.codec.http2.Http2PingFrame
 
 /**
  * A Transport implementation based on Netty's Channel which buffers writes.  This Transport buffers
@@ -32,6 +37,8 @@ class BufferingChannelTransport(
   omitStackTraceOnInactive: Boolean = false
 ) extends ChannelTransport(ch, readQueue, omitStackTraceOnInactive) {
 
+  private val log = Logger.get("h2")
+
   // Satisfy the done promise when the write completes.
   private case class WriteItem(msg: Any, done: Promise[Unit])
 
@@ -42,6 +49,7 @@ class BufferingChannelTransport(
   // without flushing. In most cases I would expect us to flush before hitting this limit.
   private[this] val MaxFlushSize = 128
   private[this] val flushScheduled = new AtomicBoolean(false)
+  private[this] val flushCounter = new AtomicInteger(0)
   private[this] val writeQueue = new LinkedBlockingQueue[WriteItem]()
   private[this] val writeChunk = new util.ArrayDeque[WriteItem](MaxFlushSize)
 
@@ -54,16 +62,30 @@ class BufferingChannelTransport(
 
   private[this] def scheduleFlush(): Unit = {
     if (flushScheduled.compareAndSet(false, true)) {
-      ch.eventLoop().execute(flush)
+      val index = flushCounter.incrementAndGet()
+      log.debug(s"Scheduling write queue flush #$index, size ${writeQueue.size()}, event loop ${ch.eventLoop()}")
+      ch.eventLoop().execute(flush(index, ch.eventLoop()))
     }
   }
 
-  private[this] val flush: Runnable = { () =>
+  private[this] def flush(index: Int, eventLoop: EventLoop): Runnable = { () =>
     var flushed = false
-    while (writeQueue.drainTo(writeChunk, MaxFlushSize) > 0) {
+    var flushedItems = 0
+    log.debug(s"Flushing write queue #$index, size ${writeQueue.size()}, event loop $eventLoop")
+    if (writeQueue.drainTo(writeChunk, MaxFlushSize) > 0) {
       while (writeChunk.size > 0) {
         val item = writeChunk.poll()
+        //if (ch.remoteAddress().asInstanceOf[InetSocketAddress].getPort == 5144) {
+        //  log.debug(s"Writing ${item.msg}")
+        //}
+        if (item.msg.isInstanceOf[Http2PingFrame]) {
+          log.debug(s"Writing ${item.msg}, ch $ch")
+        }
         val f = toFuture(ch.write(item.msg))
+        flushedItems += 1
+        if (item.msg.isInstanceOf[Http2PingFrame]) {
+          log.debug(s"Wrote ${item.msg}, ch $ch")
+        }
         item.done.become(f)
       }
       flushed = true
@@ -74,6 +96,7 @@ class BufferingChannelTransport(
       ch.flush()
     }
 
+    log.debug(s"Flushed write queue #$index, items $flushedItems, event loop $eventLoop")
     flushScheduled.set(false)
     if (!writeQueue.isEmpty) {
       scheduleFlush()
